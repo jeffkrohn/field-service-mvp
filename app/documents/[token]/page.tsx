@@ -8,9 +8,17 @@ type DocumentRow = {
   kind: string | null;
   number: string | null;
   status: string | null;
+
+  // legacy/stored total (you already had this)
   total: number | null;
 
-  // public link fields (RLS will protect, but these are often present)
+  // NEW: tax + stored totals (add these columns in Supabase)
+  tax_rate_pct?: number | null;
+  subtotal?: number | null;
+  tax_total?: number | null;
+  total_calculated?: number | null;
+
+  // public link fields
   public_token: string | null;
   public_started_at: string | null;
   public_expires_at: string | null;
@@ -20,7 +28,7 @@ type GroupRow = {
   id: string;
   document_id: string;
   name?: string | null;
-  title?: string | null; // some people use title instead of name
+  title?: string | null;
   sort_order?: number | null;
 };
 
@@ -53,8 +61,12 @@ function money(n: number) {
 }
 
 function num(n: unknown, fallback = 0) {
-  const x = typeof n === "number" && Number.isFinite(n) ? n : fallback;
-  return x;
+  return typeof n === "number" && Number.isFinite(n) ? n : fallback;
+}
+
+function pct(n: number) {
+  // shows 5.5 as "5.5%"
+  return `${n.toLocaleString(undefined, { maximumFractionDigits: 3 })}%`;
 }
 
 function computeLine(item: LineItemRow) {
@@ -68,14 +80,15 @@ function computeLine(item: LineItemRow) {
   const markupPct = num(item.materials_markup_pct, 0);
   const materialsSell = materialsCost * (1 + markupPct / 100);
 
-  // If you want qty to affect totals, apply it here.
-  // For service work it’s common that qty reflects "each" and labor/materials already match that,
-  // but if you prefer qty multiplier, uncomment the next two lines:
-  // const laborTotal = laborSubtotal * qty;
-  // const materialsTotal = materialsSell * qty;
-
+  // ✅ Recommendation for service work:
+  // Treat labor/materials as already “for the job”, NOT multiplied by qty.
+  // If you later want qty to multiply everything, change these two lines:
   const laborTotal = laborSubtotal;
   const materialsTotal = materialsSell;
+
+  // If you want qty multiplier, use:
+  // const laborTotal = laborSubtotal * qty;
+  // const materialsTotal = materialsSell * qty;
 
   const lineTotal = laborTotal + materialsTotal;
 
@@ -91,6 +104,7 @@ function computeLine(item: LineItemRow) {
     materialsTotal,
     lineTotal,
     taxableAmount,
+    markupPct,
   };
 }
 
@@ -99,22 +113,19 @@ export default async function DocumentPublicPage(props: {
 }) {
   const { token } = await props.params;
 
-  // 1) Fetch the document by token (RLS policy should allow only valid tokens)
+  // 1) Fetch the document by token
   const docRes = await supabase
     .from("documents")
     .select("*")
     .eq("public_token", token)
     .maybeSingle<DocumentRow>();
 
-  if (docRes.error) {
-    // If you want to display a friendly message instead of 404, we can do that too.
-    notFound();
-  }
+  if (docRes.error) notFound();
 
   const doc = docRes.data;
   if (!doc) notFound();
 
-  // 2) Fetch groups (if you have them)
+  // 2) Fetch groups
   const groupsRes = await supabase
     .from("document_groups")
     .select("*")
@@ -135,7 +146,7 @@ export default async function DocumentPublicPage(props: {
 
   // Sort: group first (null last), then sort_order, then created_at
   items.sort((a, b) => {
-    const ga = a.group_id ?? "zzzz"; // push nulls to bottom
+    const ga = a.group_id ?? "zzzz";
     const gb = b.group_id ?? "zzzz";
     if (ga < gb) return -1;
     if (ga > gb) return 1;
@@ -149,37 +160,37 @@ export default async function DocumentPublicPage(props: {
     return ca.localeCompare(cb);
   });
 
-  // Index groups
-  const groupLabel = (g: GroupRow) => g.name ?? g.title ?? "Group";
-  const groupMap = new Map<string, GroupRow>();
-  for (const g of groups) groupMap.set(g.id, g);
-
   // Build grouped output
+  const groupLabel = (g: GroupRow) => g.name ?? g.title ?? "Group";
+
   const grouped: Array<{ key: string; label: string; rows: LineItemRow[] }> = [];
 
-  // Items with a group_id
   for (const g of groups) {
     const rows = items.filter((i) => i.group_id === g.id);
-    if (rows.length) {
-      grouped.push({ key: g.id, label: groupLabel(g), rows });
-    }
+    if (rows.length) grouped.push({ key: g.id, label: groupLabel(g), rows });
   }
 
-  // Items without group
   const ungrouped = items.filter((i) => !i.group_id);
-  if (ungrouped.length) {
-    grouped.push({ key: "ungrouped", label: "Items", rows: ungrouped });
-  }
+  if (ungrouped.length) grouped.push({ key: "ungrouped", label: "Items", rows: ungrouped });
 
-  // Totals
-  let subtotal = 0;
+  // ✅ Totals (Option A: line items are source of truth)
+  let subtotalCalculated = 0;
   let taxableSubtotal = 0;
 
   for (const it of items) {
     const c = computeLine(it);
-    subtotal += c.lineTotal;
+    subtotalCalculated += c.lineTotal;
     taxableSubtotal += c.taxableAmount;
   }
+
+  const taxRatePct = num(doc.tax_rate_pct, 0);
+  const taxTotalCalculated = taxableSubtotal * (taxRatePct / 100);
+  const grandTotalCalculated = subtotalCalculated + taxTotalCalculated;
+
+  const storedSubtotal = typeof doc.subtotal === "number" ? doc.subtotal : null;
+  const storedTaxTotal = typeof doc.tax_total === "number" ? doc.tax_total : null;
+  const storedTotalCalculated =
+    typeof doc.total_calculated === "number" ? doc.total_calculated : null;
 
   return (
     <main style={{ maxWidth: 920, margin: "0 auto", padding: 24, fontFamily: "system-ui" }}>
@@ -187,6 +198,7 @@ export default async function DocumentPublicPage(props: {
 
       <div style={{ marginBottom: 18, color: "#333" }}>
         <div>✅ Valid document link</div>
+
         <div style={{ marginTop: 10 }}>
           <strong>Kind:</strong> {doc.kind ?? "—"}
           <br />
@@ -207,7 +219,7 @@ export default async function DocumentPublicPage(props: {
           <h2 style={{ fontSize: 16, margin: "10px 0" }}>{section.label}</h2>
 
           <div style={{ border: "1px solid #ddd", borderRadius: 10, overflow: "hidden" }}>
-            {section.rows.map((it) => {
+            {section.rows.map((it, idx) => {
               const c = computeLine(it);
               return (
                 <div
@@ -217,7 +229,7 @@ export default async function DocumentPublicPage(props: {
                     gridTemplateColumns: "1fr 140px",
                     gap: 14,
                     padding: 14,
-                    borderTop: "1px solid #eee",
+                    borderTop: idx === 0 ? "none" : "1px solid #eee",
                   }}
                 >
                   <div>
@@ -236,15 +248,21 @@ export default async function DocumentPublicPage(props: {
 
                     <div style={{ marginTop: 8, color: "#555", fontSize: 13 }}>
                       <div>
-                        <strong>Labor:</strong>{" "}
-                        {money(c.laborTotal)}{" "}
-                        {it.labor_hours ? `(${it.labor_hours} hrs @ ${money(num(it.labor_rate, 0))})` : ""}
+                        <strong>Labor:</strong> {money(c.laborTotal)}{" "}
+                        {it.labor_hours
+                          ? `(${it.labor_hours} hrs @ ${money(num(it.labor_rate, 0))})`
+                          : ""}
                         {it.taxable_labor ? " • taxable" : ""}
                       </div>
+
                       <div>
-                        <strong>Materials:</strong>{" "}
-                        {money(c.materialsTotal)}{" "}
-                        {it.materials_cost ? `(cost ${money(num(it.materials_cost, 0))} + ${num(it.materials_markup_pct, 0)}% markup)` : ""}
+                        <strong>Materials:</strong> {money(c.materialsTotal)}{" "}
+                        {it.materials_cost
+                          ? `(cost ${money(num(it.materials_cost, 0))} + ${num(
+                              it.materials_markup_pct,
+                              0
+                            )}% markup)`
+                          : ""}
                         {it.taxable_materials ? " • taxable" : ""}
                       </div>
                     </div>
@@ -263,26 +281,47 @@ export default async function DocumentPublicPage(props: {
 
       <hr style={{ margin: "18px 0" }} />
 
+      {/* Totals box */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 10 }}>
         <div style={{ color: "#555" }}>
           <div>Subtotal (calculated):</div>
           <div>Taxable subtotal:</div>
-          <div style={{ fontSize: 12, color: "#777", marginTop: 6 }}>
-            Note: We’re not calculating tax yet because we haven’t added a tax rate field/settings.
-          </div>
+          <div>Tax rate:</div>
+          <div>Tax total (calculated):</div>
+          <div style={{ marginTop: 6, fontWeight: 800, color: "#222" }}>Grand total:</div>
         </div>
 
         <div style={{ textAlign: "right" }}>
-          <div style={{ fontWeight: 800 }}>{money(subtotal)}</div>
+          <div style={{ fontWeight: 800 }}>{money(subtotalCalculated)}</div>
           <div style={{ fontWeight: 800 }}>{money(taxableSubtotal)}</div>
+          <div style={{ fontWeight: 800 }}>{pct(taxRatePct)}</div>
+          <div style={{ fontWeight: 800 }}>{money(taxTotalCalculated)}</div>
+          <div style={{ marginTop: 6, fontSize: 18, fontWeight: 900 }}>
+            {money(grandTotalCalculated)}
+          </div>
         </div>
       </div>
 
-      {typeof doc.total === "number" ? (
-        <div style={{ marginTop: 12, color: "#666" }}>
-          (Stored document total: <strong>{money(doc.total)}</strong>)
+      {/* Stored totals (optional comparison) */}
+      <div style={{ marginTop: 14, color: "#666", fontSize: 13 }}>
+        <div style={{ marginBottom: 6, fontWeight: 700, color: "#444" }}>Stored values (optional)</div>
+        <div>documents.subtotal: {storedSubtotal === null ? "—" : money(storedSubtotal)}</div>
+        <div>documents.tax_total: {storedTaxTotal === null ? "—" : money(storedTaxTotal)}</div>
+        <div>
+          documents.total_calculated:{" "}
+          {storedTotalCalculated === null ? "—" : money(storedTotalCalculated)}
         </div>
-      ) : null}
+
+        {typeof doc.total === "number" ? (
+          <div style={{ marginTop: 6 }}>
+            documents.total (legacy): <strong>{money(doc.total)}</strong>
+          </div>
+        ) : null}
+
+        <div style={{ marginTop: 8, color: "#777" }}>
+          Tip: Later we’ll add a “Finalize/Send” action that writes the calculated totals into the stored columns.
+        </div>
+      </div>
     </main>
   );
 }
